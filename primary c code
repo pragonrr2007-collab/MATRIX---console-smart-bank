@@ -1,0 +1,695 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <ctype.h>
+#include <strings.h> /* for strcasecmp on POSIX */
+
+#define MAX_ACCOUNTS 200
+#define MAX_NAME 80
+#define MAX_ACCSTR 32
+#define MAX_TX 20000
+
+/* Fees */
+#define SERVICE_CHARGE 1.00
+#define SMS_COST 0.50
+#define OTP_COST 0.10
+#define PRE_SCHEDULE_COST 0.50
+
+typedef enum { TX_DEPOSIT=0, TX_WITHDRAW=1, TX_TRANSFER=2 } TxType;
+
+typedef struct {
+    TxType type;
+    char from[MAX_ACCSTR];
+    char to[MAX_ACCSTR];
+    double amount;
+    double fee;
+    int is_scheduled;       /* 0 or 1 */
+    time_t scheduled_for;   /* 0 if not scheduled */
+    time_t when;            /* execution/creation time */
+} Transaction;
+
+typedef struct {
+    char acc[MAX_ACCSTR];
+    char name[MAX_NAME];
+    int pin;
+    double bal;
+} Account;
+
+/* Globals */
+static Account accounts[MAX_ACCOUNTS];
+static int count_acc = 0;
+static Transaction transactions[MAX_TX];
+static int count_tx = 0;
+static int language = 0; /* 0 English, 1 Tamil */
+
+/* Simple utilities */
+static void flush_stdin(void) {
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) { }
+}
+
+/* safe read line */
+static void read_line_prompt(const char *prompt, char *buf, size_t n) {
+    if (prompt) fputs(prompt, stdout);
+    if (!fgets(buf, (int)n, stdin)) { buf[0]=0; return; }
+    buf[strcspn(buf, "\r\n")] = 0;
+}
+
+/* format time */
+static void format_time(time_t t, char *out, size_t n) {
+    if (t == 0) { snprintf(out,n,"N/A"); return; }
+    struct tm tmv;
+#if defined(__unix__) || defined(__linux__) || defined(__APPLE__) || defined(__MACH__)
+    localtime_r(&t,&tmv);
+#else
+    { struct tm *p = localtime(&t); if (p) tmv = *p; else memset(&tmv,0,sizeof tmv); }
+#endif
+    strftime(out,n,"%Y-%m-%d %H:%M:%S",&tmv);
+}
+
+/* Persistence helpers (basic) */
+static int save_accounts_to_disk(void) {
+    FILE *f = fopen("accounts.dat","wb");
+    if (!f) return 0;
+    if (fwrite(&count_acc, sizeof(count_acc), 1, f) != 1) { fclose(f); return 0; }
+    if (count_acc > 0) {
+        if (fwrite(accounts, sizeof(Account), count_acc, f) != (size_t)count_acc) { fclose(f); return 0; }
+    }
+    fclose(f);
+    return 1;
+}
+static int load_accounts_from_disk(void) {
+    FILE *f = fopen("accounts.dat","rb");
+    if (!f) { count_acc = 0; return 0; }
+    if (fread(&count_acc, sizeof(count_acc), 1, f) != 1) { fclose(f); count_acc = 0; return 0; }
+    if (count_acc > 0) {
+        if (fread(accounts, sizeof(Account), count_acc, f) != (size_t)count_acc) { fclose(f); count_acc=0; return 0; }
+    }
+    fclose(f);
+    return 1;
+}
+static int save_transactions_to_disk(void) {
+    FILE *f = fopen("transactions.dat","wb");
+    if (!f) return 0;
+    if (fwrite(&count_tx, sizeof(count_tx), 1, f) != 1) { fclose(f); return 0; }
+    if (count_tx > 0) {
+        if (fwrite(transactions, sizeof(Transaction), count_tx, f) != (size_t)count_tx) { fclose(f); return 0; }
+    }
+    fclose(f);
+    return 1;
+}
+static int load_transactions_from_disk(void) {
+    FILE *f = fopen("transactions.dat","rb");
+    if (!f) { count_tx = 0; return 0; }
+    if (fread(&count_tx, sizeof(count_tx), 1, f) != 1) { fclose(f); count_tx = 0; return 0; }
+    if (count_tx > 0) {
+        if (fread(transactions, sizeof(Transaction), count_tx, f) != (size_t)count_tx) { fclose(f); count_tx=0; return 0; }
+    }
+    fclose(f);
+    return 1;
+}
+
+/* Logging helper */
+static void append_log(const Transaction *tx) {
+    FILE *f = fopen("transactions.log","a");
+    if (!f) return;
+    char when_s[64]; format_time(tx->when, when_s, sizeof when_s);
+    const char *tstr = tx->type==TX_DEPOSIT ? "DEPOSIT" : tx->type==TX_WITHDRAW ? "WITHDRAW" : "TRANSFER";
+    fprintf(f,"[%s] %s | From:%s | To:%s | Amt:%.2f | Fee:%.2f | Sch:%d | SchFor:%ld\n",
+            when_s, tstr, tx->from, tx->to[0]?tx->to:"-", tx->amount, tx->fee, tx->is_scheduled, (long)tx->scheduled_for);
+    fclose(f);
+}
+
+/* helpers to find account index */
+static int find_account(const char *acc) {
+    for (int i=0;i<count_acc;++i) if (strcmp(accounts[i].acc, acc)==0) return i;
+    return -1;
+}
+
+/* record transaction */
+static void record_tx(const Transaction *tx) {
+    if (count_tx < MAX_TX) transactions[count_tx++] = *tx;
+    append_log(tx);
+    save_transactions_to_disk();
+}
+
+/* OTP generator (seeded in main) */
+static int generate_otp(void) {
+    return rand() % 900000 + 100000; /* 6-digit */
+}
+
+/* verify pin + otp */
+static int verify_pin_and_otp_for_index(int idx) {
+    char buf[64];
+    read_line_prompt(language ? "PIN: " : "Enter PIN: ", buf, sizeof buf);
+    int entered = atoi(buf);
+    if (accounts[idx].pin != entered) {
+        printf("%s\n", language ? "தவறான PIN." : "Wrong PIN.");
+        return 0;
+    }
+    int code = generate_otp();
+    printf(language ? "OTP: %06d\n" : "OTP: %06d\n", code);
+    char otpbuf[64];
+    read_line_prompt(language ? "OTP ஐ உள்ளிடவும்: " : "Enter OTP: ", otpbuf, sizeof otpbuf);
+    if (atoi(otpbuf) != code) {
+        printf("%s\n", language ? "OTP தவறானது." : "OTP incorrect.");
+        return 0;
+    }
+    return 1;
+}
+
+/* UI */
+static void banner(void) {
+    printf("\n======== MATRIX-smart bank =================================================\n");
+                  printf (" efficient ,reliable, smart & secure\n\n");
+                  
+}
+
+/* Core features */
+
+/* create account */
+static void create_account(void) {
+    banner();
+    if (count_acc >= MAX_ACCOUNTS) { printf("Storage full.\n"); return; }
+    char accnum[MAX_ACCSTR];
+    read_line_prompt(language ? "கணக்கு எண்: " : "Enter account number: ", accnum, sizeof accnum);
+    if (find_account(accnum) != -1) { printf("%s\n", language ? "கணக்கு ஏற்கனவே உள்ளது." : "Account already exists."); return; }
+    Account a;
+    memset(&a,0,sizeof a);
+    strncpy(a.acc, accnum, sizeof a.acc-1);
+    read_line_prompt(language ? "பெயர்: " : "Enter name: ", a.name, sizeof a.name);
+    char pinbuf[64];
+    read_line_prompt(language ? "PIN (numbers): " : "Set PIN (numbers): ", pinbuf, sizeof pinbuf);
+    a.pin = atoi(pinbuf);
+    char balbuf[64];
+    read_line_prompt(language ? "ஆரம்ப இருப்பு: " : "Enter initial balance: ", balbuf, sizeof balbuf);
+    a.bal = atof(balbuf);
+    accounts[count_acc++] = a;
+    save_accounts_to_disk();
+    Transaction tx; memset(&tx,0,sizeof tx);
+    tx.type = TX_DEPOSIT; strncpy(tx.from, a.acc, sizeof tx.from-1); tx.amount = a.bal; tx.fee = 0.0; tx.when = time(NULL); tx.is_scheduled = 0;
+    record_tx(&tx);
+    printf("%s\n", language ? "கணக்கு வெற்றிகரமாக உருவாக்கப்பட்டது." : "Account created successfully.");
+}
+
+/* deposit or withdraw */
+static void deposit_or_withdraw(int is_withdraw) {
+    banner();
+    if (count_acc == 0) { printf("%s\n", language ? "தற்போது கணக்குகள் எதுவும் இல்லை." : "There are currently no accounts."); return; }
+    char accnum[MAX_ACCSTR];
+    read_line_prompt(is_withdraw ? (language?"பணம் எடுக்க வேண்டிய கணக்கு: ":"Account to withdraw from: ") : (language?"வைப்பு கணக்கு: ":"Account to deposit to: "), accnum, sizeof accnum);
+    int idx = find_account(accnum);
+    if (idx == -1) { printf("%s\n", language ? "கணக்கு கிடையாது." : "Account not found."); return; }
+    if (!verify_pin_and_otp_for_index(idx)) return;
+    char amtbuf[64]; read_line_prompt(is_withdraw ? (language?"எடுத்தல் தொகை: ":"Enter withdrawal amount: ") : (language?"வைப்பு தொகை: ":"Enter deposit amount: "), amtbuf, sizeof amtbuf);
+    double amt = atof(amtbuf);
+    if (amt <= 0.0) { printf("%s\n", language ? "தவறான தொகை." : "Invalid amount."); return; }
+    Transaction tx; memset(&tx,0,sizeof tx);
+    tx.type = is_withdraw ? TX_WITHDRAW : TX_DEPOSIT;
+    strncpy(tx.from, accnum, sizeof tx.from-1);
+    tx.amount = amt;
+    tx.fee = SERVICE_CHARGE + SMS_COST + OTP_COST;
+    tx.is_scheduled = 0;
+    tx.when = time(NULL);
+    if (is_withdraw) {
+        if (accounts[idx].bal < (amt + tx.fee)) { printf("%s\n", language ? "போதுமான இருப்பு இல்லை." : "Insufficient balance."); return; }
+        accounts[idx].bal -= (amt + tx.fee);
+    } else {
+        accounts[idx].bal += (amt - tx.fee);
+    }
+    record_tx(&tx);
+    save_accounts_to_disk();
+    printf("%s %.2f\n", language ? "பரிவர்த்தனை வெற்றி. கட்டணம்:" : "Transaction successful. Fee:", tx.fee);
+}
+
+/* transfer */
+static void transfer_flow(void) {
+    banner();
+    if (count_acc < 2) { printf("%s\n", language ? "போதுமான கணக்குகள் இல்லை." : "Not enough accounts to transfer."); return; }
+    char from[MAX_ACCSTR], to[MAX_ACCSTR];
+    read_line_prompt(language ? "அனுப்புநர் கணக்கு: " : "Sender account: ", from, sizeof from);
+    int i_from = find_account(from);
+    if (i_from == -1) { printf("%s\n", language ? "அனுப்புநர் கிடையாது." : "Sender not found."); return; }
+    if (!verify_pin_and_otp_for_index(i_from)) return;
+    read_line_prompt(language ? "பெறுநர் கணக்கு: " : "Receiver account: ", to, sizeof to);
+    int i_to = find_account(to);
+    if (i_to == -1) { printf("%s\n", language ? "பெறுநர் கிடைக்கவில்லை." : "Receiver not found."); return; }
+    char amtbuf[64]; read_line_prompt(language ? "மாற்றத் தொகை: " : "Enter transfer amount: ", amtbuf, sizeof amtbuf);
+    double amt = atof(amtbuf);
+    if (amt <= 0.0) { printf("%s\n", language ? "தவறான தொகை." : "Invalid amount."); return; }
+    Transaction tx; memset(&tx,0,sizeof tx);
+    tx.type = TX_TRANSFER; strncpy(tx.from, from, sizeof tx.from-1); strncpy(tx.to, to, sizeof tx.to-1);
+    tx.amount = amt; tx.fee = SERVICE_CHARGE + SMS_COST + OTP_COST; tx.is_scheduled = 0; tx.when = time(NULL);
+    if (accounts[i_from].bal < (amt + tx.fee)) { printf("%s\n", language ? "அனுப்புநரிடம் போதுமான இருப்பு இல்லை." : "Sender has insufficient balance."); return; }
+    accounts[i_from].bal -= (amt + tx.fee); accounts[i_to].bal += amt;
+    record_tx(&tx);
+    save_accounts_to_disk();
+    printf("%s %.2f\n", language ? "பரிமாற்றம் வெற்றி. கட்டணம்:" : "Transfer successful. Fee:", tx.fee);
+}
+
+/* view balance */
+static void view_balance(void) {
+    banner();
+    if (count_acc==0) { printf("%s\n", language ? "தற்போது கணக்குகள் எதுவும் இல்லை." : "There are currently no accounts."); return; }
+    char accnum[MAX_ACCSTR];
+    read_line_prompt(language ? "கணக்கு எண்: " : "Enter account number: ", accnum, sizeof accnum);
+    int idx = find_account(accnum); if (idx == -1) { printf("%s\n", language ? "கணக்கு கிடையாது." : "Account not found."); return; }
+    if (!verify_pin_and_otp_for_index(idx)) return;
+    printf("%s %.2f\n", language ? "இருப்பு:" : "Balance:", accounts[idx].bal);
+}
+
+/* show all accounts */
+static void view_all_accounts(void) {
+    banner();
+    if (count_acc==0) { printf("%s\n", language ? "கணக்குகள் இல்லை." : "No accounts exist."); return; }
+    puts("+----------------+--------------------------------+----------------+");
+    printf("| %-14s | %-30s | %-14s |\n", language ? "கணக்கு" : "Account No", language ? "பெயர்" : "Name", language ? "இருப்பு" : "Balance");
+    puts("+----------------+--------------------------------+----------------+");
+    for (int i=0;i<count_acc;++i) {
+        printf("| %-14s | %-30s | %14.2f |\n", accounts[i].acc, accounts[i].name, accounts[i].bal);
+    }
+    puts("+----------------+--------------------------------+----------------+");
+}
+
+/* show scheduled transactions */
+static void view_scheduled(void) {
+    banner();
+    puts("+----+----------------+----------------+-----------+---------------------+");
+    printf("| %-2s | %-14s | %-14s | %-9s | %-19s |\n", "No", language ? "Account" : "Account", language ? "To" : "To", language ? "Amount" : "Amount", language ? "Scheduled For" : "Scheduled For");
+    puts("+----+----------------+----------------+-----------+---------------------+");
+    int idx=0;
+    for (int i=0;i<count_tx;++i) {
+        Transaction *tx = &transactions[i];
+        if (!tx->is_scheduled) continue;
+        char sf[32]; format_time(tx->scheduled_for, sf, sizeof sf);
+        printf("| %2d | %-14s | %-14s | %9.2f | %-19s |\n", ++idx, tx->from, tx->to[0]?tx->to:"-", tx->amount, sf);
+    }
+    puts("+----+----------------+----------------+-----------+---------------------+");
+    if (idx==0) printf("%s\n", language ? "முன்நியமிக்கப்பட்டது எதுவும் இல்லை." : "No scheduled transactions.");
+}
+
+/* show history (all or specific account) */
+static void show_history(void) {
+    banner();
+    if (count_tx==0) { printf("%s\n", language ? "பரிவர்த்தனை பதிவுகள் இல்லை." : "No transactions recorded."); return; }
+    char acc[MAX_ACCSTR];
+    read_line_prompt(language ? "கணக்கு (அல்லது Enter அனைத்து): " : "Enter account (or Enter for all): ", acc, sizeof acc);
+    int filter = acc[0] != '\0';
+    puts("+----+------------+----------------+------------+-----------+-----------+---------------------+");
+    printf("| %-2s | %-10s | %-14s | %-10s | %-9s | %-9s | %-19s |\n", "No", "Type", language ? "Account" : "Account", language ? "To" : "To", "Amount", "Fee", language ? "When" : "When");
+    puts("+----+------------+----------------+------------+-----------+-----------+---------------------+");
+    int idx=0;
+    for (int i=0;i<count_tx;++i) {
+        Transaction *tx = &transactions[i];
+        if (filter && strcmp(tx->from, acc)!=0 && (tx->to[0]==0 || strcmp(tx->to, acc)!=0)) continue;
+        char when_s[32]; format_time(tx->when, when_s, sizeof when_s);
+        const char *tstr = tx->type==TX_DEPOSIT ? (language?"வைப்பு":"DEPOSIT") : tx->type==TX_WITHDRAW ? (language?"பணம் எடு":"WITHDRAW") : (language?"பரிமாற்றம்":"TRANSFER");
+        printf("| %2d | %-10s | %-14s | %-10s | %9.2f | %9.2f | %-19s |\n", ++idx, tstr, tx->from, tx->to[0]?tx->to:"-", tx->amount, tx->fee, when_s);
+    }
+    puts("+----+------------+----------------+------------+-----------+-----------+---------------------+");
+    if (idx==0) printf("%s\n", language ? "பொருத்தமான பதிவுகள் இல்லை." : "No matching records.");
+}
+
+/* ---------------- Additional options implementations ---------------- */
+
+/* 1. Account Summary / Statement - prints transactions for an account */
+static void account_summary(void) {
+    banner();
+    if (count_acc==0) { printf("%s\n", language ? "கணக்குகள் இல்லை." : "No accounts exist."); return; }
+    char acc[MAX_ACCSTR];
+    read_line_prompt(language ? "கணக்கு எண்: " : "Enter account number: ", acc, sizeof acc);
+    int idx = find_account(acc);
+    if (idx == -1) { printf("%s\n", language ? "கணக்கு இல்லை." : "Account not found."); return; }
+    printf("%s: %s\n", language ? "Account" : "Account", accounts[idx].acc);
+    printf("%s: %s\n", language ? "Name" : "Name", accounts[idx].name);
+    puts("---- Transactions ----");
+    int found = 0;
+    for (int i=0;i<count_tx;++i) {
+        Transaction *tx = &transactions[i];
+        if (strcmp(tx->from, acc)==0 || (tx->to[0] && strcmp(tx->to, acc)==0)) {
+            char when_s[32]; format_time(tx->when, when_s, sizeof when_s);
+            const char *tstr = tx->type==TX_DEPOSIT ? "DEPOSIT" : tx->type==TX_WITHDRAW ? "WITHDRAW" : "TRANSFER";
+            printf("%s | %s | From:%s To:%s Amt:%.2f Fee:%.2f\n", when_s, tstr, tx->from, tx->to[0]?tx->to:"-", tx->amount, tx->fee);
+            found = 1;
+        }
+    }
+    if (!found) printf("%s\n", language ? "பரவிர்த்தனைகள் இல்லை." : "No transactions for this account.");
+}
+
+/* 2. Change PIN */
+static void change_pin(void) {
+    banner();
+    char acc[MAX_ACCSTR];
+    read_line_prompt(language ? "கணக்கு எண்: " : "Enter account number: ", acc, sizeof acc);
+    int idx = find_account(acc);
+    if (idx == -1) { printf("%s\n", language ? "கணக்கு இல்லை." : "Account not found."); return; }
+    if (!verify_pin_and_otp_for_index(idx)) return;
+    char newpin[32];
+    read_line_prompt(language ? "புதிய PIN: " : "Enter new PIN: ", newpin, sizeof newpin);
+    accounts[idx].pin = atoi(newpin);
+    save_accounts_to_disk();
+    printf("%s\n", language ? "PIN வெற்றிகரமாக மாற்றப்பட்டது." : "PIN changed successfully.");
+}
+
+/* 3. Schedule Future Transaction */
+static void schedule_future_transaction(void) {
+    banner();
+    char typbuf[16];
+    read_line_prompt(language ? "தரம் (deposit/withdraw/transfer): " : "Type (deposit/withdraw/transfer): ", typbuf, sizeof typbuf);
+    char from[MAX_ACCSTR], to[MAX_ACCSTR];
+    read_line_prompt(language ? "From account: " : "From account: ", from, sizeof from);
+    int idx_from = find_account(from);
+    if (idx_from == -1) { printf("%s\n", language ? "அனுப்புநர் இல்லை." : "Sender not found."); return; }
+    /* require PIN+OTP for scheduling on that account */
+    if (!verify_pin_and_otp_for_index(idx_from)) return;
+    double amt;
+    char amtbuf[64];
+    read_line_prompt(language ? "தொகை: " : "Amount: ", amtbuf, sizeof amtbuf); amt = atof(amtbuf);
+    if (amt <= 0.0) { printf("%s\n", language ? "தவறான தொகை." : "Invalid amount."); return; }
+    to[0] = 0;
+    if (strcasecmp(typbuf,"transfer")==0) {
+        read_line_prompt(language ? "To account: " : "To account: ", to, sizeof to);
+        if (find_account(to) == -1) { printf("%s\n", language ? "பெறுநர் கிடையாது." : "Receiver not found."); return; }
+    }
+    char dt[64];
+    read_line_prompt(language ? "நாள்/நேரம் (YYYY-MM-DD HH:MM:SS): " : "Enter date/time (YYYY-MM-DD HH:MM:SS): ", dt, sizeof dt);
+    struct tm tmv; memset(&tmv,0,sizeof tmv);
+    if (sscanf(dt, "%d-%d-%d %d:%d:%d", &tmv.tm_year, &tmv.tm_mon, &tmv.tm_mday, &tmv.tm_hour, &tmv.tm_min, &tmv.tm_sec) < 3) {
+        printf("%s\n", language ? "தவறான தேதி." : "Bad date format."); return;
+    }
+    /* convert: note tm_year currently has year not year-1900 */
+    tmv.tm_year -= 1900; tmv.tm_mon -= 1; tmv.tm_isdst = -1;
+    time_t sch = mktime(&tmv);
+    if (sch == (time_t)-1 || sch <= time(NULL)) { printf("%s\n", language ? "எதிர்கால தேதியை கொடுக்கவும்." : "Provide future date."); return; }
+    Transaction tx; memset(&tx,0,sizeof tx);
+    if (strcasecmp(typbuf,"deposit")==0) tx.type = TX_DEPOSIT;
+    else if (strcasecmp(typbuf,"withdraw")==0) tx.type = TX_WITHDRAW;
+    else tx.type = TX_TRANSFER;
+    strncpy(tx.from, from, sizeof tx.from-1);
+    if (to[0]) strncpy(tx.to, to, sizeof tx.to-1);
+    tx.amount = amt;
+    tx.fee = SERVICE_CHARGE + SMS_COST + PRE_SCHEDULE_COST;
+    tx.is_scheduled = 1;
+    tx.scheduled_for = sch;
+    tx.when = time(NULL);
+    record_tx(&tx);
+    printf("%s\n", language ? "பரிவர்த்தனை திட்டமிடப்பட்டது." : "Transaction scheduled.");
+}
+
+/* 4. Cancel Scheduled Transaction */
+static void cancel_scheduled_transaction(void) {
+    banner();
+    if (count_tx==0) { printf("%s\n", language ? "பரிவர்தனைகள் இல்லை." : "No transactions."); return; }
+    char acc[MAX_ACCSTR];
+    read_line_prompt(language ? "உங்கள் கணக்கு எண்: " : "Your account number: ", acc, sizeof acc);
+    int idx_acc = find_account(acc);
+    if (idx_acc == -1) { printf("%s\n", language ? "கணக்கு இல்லை." : "Account not found."); return; }
+    /* require PIN+OTP */
+    if (!verify_pin_and_otp_for_index(idx_acc)) return;
+    /* list scheduled transactions for this account */
+    int found = 0;
+    for (int i=0;i<count_tx;++i) {
+        Transaction *tx = &transactions[i];
+        if (tx->is_scheduled && strcmp(tx->from, acc)==0) {
+            char sf[32]; format_time(tx->scheduled_for, sf, sizeof sf);
+            printf("Index %d | Type:%d | To:%s | Amt:%.2f | Sch:%s\n", i, tx->type, tx->to[0]?tx->to:"-", tx->amount, sf);
+            found = 1;
+        }
+    }
+    if (!found) { printf("%s\n", language ? "முன்நியமிக்கப்பட்ட பரிவர்த்தனை இல்லை." : "No scheduled transactions."); return; }
+    char idxbuf[32];
+    read_line_prompt(language ? "அடைந்ததி எண்ணை உள்ளிடுக (Index): " : "Enter index to cancel: ", idxbuf, sizeof idxbuf);
+    int ix = atoi(idxbuf);
+    if (ix < 0 || ix >= count_tx || !transactions[ix].is_scheduled) { printf("%s\n", language ? "தவறான குறியீடு." : "Invalid index."); return; }
+    transactions[ix].is_scheduled = 0;
+    transactions[ix].scheduled_for = 0;
+    save_transactions_to_disk();
+    printf("%s\n", language ? "நியமிப்பு ரத்து செய்யப்பட்டு உள்ளது." : "Scheduled transaction cancelled.");
+}
+
+/* 5. Export data to CSV */
+static void export_data_to_file(void) {
+    banner();
+    FILE *facc = fopen("accounts_export.csv","w");
+    if (!facc) { printf("%s\n", language ? "கோப்பு திறக்க முடியவில்லை." : "Unable to open file."); return; }
+    fprintf(facc,"acc,name,balance,pin\n");
+    for (int i=0;i<count_acc;++i) fprintf(facc,"%s,%s,%.2f,%d\n", accounts[i].acc, accounts[i].name, accounts[i].bal, accounts[i].pin);
+    fclose(facc);
+    FILE *ftx = fopen("transactions_export.csv","w");
+    if (!ftx) { printf("%s\n", language ? "பரிவர்த்தனை கோப்பு தோல்வி." : "Transactions file failed."); return; }
+    fprintf(ftx,"when,type,from,to,amount,fee,is_scheduled,scheduled_for\n");
+    for (int i=0;i<count_tx;++i) {
+        char when_s[32], sch_s[32];
+        format_time(transactions[i].when, when_s, sizeof when_s);
+        format_time(transactions[i].scheduled_for, sch_s, sizeof sch_s);
+        fprintf(ftx,"%s,%d,%s,%s,%.2f,%.2f,%d,%s\n", when_s, transactions[i].type, transactions[i].from, transactions[i].to, transactions[i].amount, transactions[i].fee, transactions[i].is_scheduled, sch_s);
+    }
+    fclose(ftx);
+    printf("%s\n", language ? "தரவு ஏற்றுமதி செய்யப்பட்டன." : "Data exported to CSV files.");
+}
+
+/* 6. Delete Account */
+static void delete_account(void) {
+    banner();
+    char acc[MAX_ACCSTR];
+    read_line_prompt(language ? "அழிக்க வேண்டிய கணக்கு எண்: " : "Account to delete: ", acc, sizeof acc);
+    int idx = find_account(acc);
+    if (idx == -1) { printf("%s\n", language ? "கணக்கு இல்லை." : "Account not found."); return; }
+    /* require PIN + OTP */
+    if (!verify_pin_and_otp_for_index(idx)) return;
+    /* remove account by shifting array */
+    for (int i=idx;i<count_acc-1;++i) accounts[i] = accounts[i+1];
+    --count_acc;
+    /* remove transactions referencing it (simple approach: mark from/to to empty) */
+    for (int i=0;i<count_tx;++i) {
+        if (strcmp(transactions[i].from, acc)==0) transactions[i].from[0] = 0;
+        if (strcmp(transactions[i].to, acc)==0) transactions[i].to[0] = 0;
+    }
+    save_accounts_to_disk();
+    save_transactions_to_disk();
+    printf("%s\n", language ? "கணக்கு நீக்கப்பட்டது." : "Account deleted.");
+}
+
+/* 7. System Report */
+static void system_report(void) {
+    banner();
+    int scheduled = 0;
+    for (int i=0;i<count_tx;++i) if (transactions[i].is_scheduled) ++scheduled;
+    printf("%s\n", language ? "---- கணினி அறிக்கை ----" : "---- System Report ----");
+    printf("%s: %d\n", language ? "மொத்த கணக்குகள்" : "Total accounts", count_acc);
+    printf("%s: %d\n", language ? "மொத்த பரிவர்த்தனைகள்" : "Total transactions", count_tx);
+    printf("%s: %d\n", language ? "முன்நியமிக்கப்பட்டவை" : "Scheduled transactions", scheduled);
+    printf("%s\n", language ? "அனைத்துப் பிரிவுகளும் செயல்பாட்டில் உள்ளன." : "All modules operational.");
+}
+
+/* 8. Reset / Clear All Data */
+static void reset_clear_all_data(void) {
+    banner();
+    char ans[8];
+    read_line_prompt(language ? "அனைத்தையும் அழிக்கவா? (y/n): " : "Reset all data? (y/n): ", ans, sizeof ans);
+    if (!(ans[0]=='y' || ans[0]=='Y')) { printf("%s\n", language ? "ரத்துசெய்யப்பட்டது." : "Aborted."); return; }
+    count_acc = 0; count_tx = 0;
+    remove("accounts.dat"); remove("transactions.dat"); remove("transactions.log");
+    printf("%s\n", language ? "அனைத்து தரவும் நீக்கப்பட்டது." : "All data cleared.");
+}
+
+/* 9. Smart Balance Calculator (AI-ish) */
+static void smart_balance_calculator(void) {
+    banner();
+    char acc[MAX_ACCSTR];
+    read_line_prompt(language ? "கணக்கு எண்: " : "Enter account number: ", acc, sizeof acc);
+    int idx = find_account(acc);
+    if (idx == -1) { printf("%s\n", language ? "கணக்கு இல்லை." : "Account not found."); return; }
+    char dt[64];
+    read_line_prompt(language ? "நாள்/நேரம் (YYYY-MM-DD HH:MM:SS): " : "Enter date/time (YYYY-MM-DD HH:MM:SS): ", dt, sizeof dt);
+    struct tm tmv; memset(&tmv,0,sizeof tmv);
+    if (sscanf(dt, "%d-%d-%d %d:%d:%d", &tmv.tm_year, &tmv.tm_mon, &tmv.tm_mday, &tmv.tm_hour, &tmv.tm_min, &tmv.tm_sec) < 3) {
+        printf("%s\n", language ? "தவறான தேதி." : "Bad date format."); return;
+    }
+    tmv.tm_year -= 1900; tmv.tm_mon -= 1; tmv.tm_isdst = -1;
+    time_t target = mktime(&tmv);
+    if (target == (time_t)-1) { printf("%s\n", language ? "தவறான தேதி." : "Bad date."); return; }
+    double current = accounts[idx].bal;
+    double scheduled_deposits = 0.0, scheduled_withdrawals = 0.0;
+    int scheduled_count = 0;
+    for (int i=0;i<count_tx;++i) {
+        Transaction *tx = &transactions[i];
+        if (!tx->is_scheduled) continue;
+        if (tx->scheduled_for <= target) {
+            ++scheduled_count;
+            if (strcmp(tx->from, accounts[idx].acc)==0) {
+                if (tx->type==TX_DEPOSIT) scheduled_deposits += (tx->amount - tx->fee);
+                else if (tx->type==TX_WITHDRAW) scheduled_withdrawals += (tx->amount + tx->fee);
+                else if (tx->type==TX_TRANSFER) scheduled_withdrawals += (tx->amount + tx->fee);
+            }
+            if (tx->type==TX_TRANSFER && strcmp(tx->to, accounts[idx].acc)==0) scheduled_deposits += tx->amount;
+        }
+    }
+    double sms_tax = scheduled_count * SMS_COST;
+    double predicted = current + scheduled_deposits - scheduled_withdrawals - sms_tax;
+    /* small ML-like tweak: average recent daily net */
+    double ml_adj = 0.0;
+    time_t now = time(NULL);
+    time_t weekago = now - 7*24*3600;
+    double sum_net = 0; int cnt=0;
+    for (int i=0;i<count_tx;++i) {
+        Transaction *tx = &transactions[i];
+        if (tx->when >= weekago && tx->when <= now) {
+            if (strcmp(tx->from, accounts[idx].acc)==0) {
+                if (tx->type==TX_DEPOSIT) sum_net += (tx->amount - tx->fee);
+                else sum_net -= (tx->amount + tx->fee);
+            }
+            if (tx->type==TX_TRANSFER && strcmp(tx->to, accounts[idx].acc)==0) sum_net += tx->amount;
+            ++cnt;
+        }
+    }
+    if (cnt>0) ml_adj = (sum_net / cnt) * 0.1;
+    printf("%s\n", language ? "---- Smart Balance Calculator ----" : "---- Smart Balance Calculator ----");
+    printf("%s: %s\n", language ? "Account" : "Account", accounts[idx].acc);
+    printf("%s: %.2f\n", language ? "Current balance" : "Current balance", current);
+    printf("%s: %.2f\n", language ? "Scheduled deposits (<=target)" : "Scheduled deposits (<=target)", scheduled_deposits);
+    printf("%s: %.2f\n", language ? "Scheduled withdrawals" : "Scheduled withdrawals", scheduled_withdrawals);
+    printf("%s: %.2f\n", language ? "SMS / Service tax (est.)" : "SMS / Service tax (est.)", sms_tax);
+    printf("%s: %.2f\n", language ? "ML Adjustment (small)" : "ML Adjustment (small)", ml_adj);
+    printf("%s: %.2f\n", language ? "Predicted balance (net)" : "Predicted balance (net)", predicted + ml_adj);
+}
+
+/* 10. Balance Predictor (ML-like) */
+static void balance_predictor_ml(void) {
+    banner();
+    char acc[MAX_ACCSTR];
+    read_line_prompt(language ? "கணக்கு எண்: " : "Enter account number: ", acc, sizeof acc);
+    int idx = find_account(acc); if (idx==-1) { printf("%s\n", language ? "கணக்கு இல்லை." : "Account not found."); return; }
+    double total_dep=0, total_wd=0; int cnt_dep=0, cnt_wd=0;
+    for (int i=0;i<count_tx;++i) {
+        Transaction *tx = &transactions[i];
+        if (strcmp(tx->from, accounts[idx].acc)==0) {
+            if (tx->type==TX_DEPOSIT) { total_dep += tx->amount; cnt_dep++; }
+            else if (tx->type==TX_WITHDRAW) { total_wd += tx->amount; cnt_wd++; }
+            else if (tx->type==TX_TRANSFER) { total_wd += tx->amount; cnt_wd++; }
+        }
+        if (tx->type==TX_TRANSFER && strcmp(tx->to, accounts[idx].acc)==0) { total_dep += tx->amount; cnt_dep++; }
+    }
+    double avg_dep = cnt_dep ? total_dep / cnt_dep : 0;
+    double avg_wd  = cnt_wd ? total_wd / cnt_wd : 0;
+    double expected_change = (avg_dep - avg_wd) * 0.7;
+    double predicted_next = accounts[idx].bal + expected_change;
+    double confidence = 50.0;
+    if (cnt_dep + cnt_wd > 20) confidence = 85.0;
+    else if (cnt_dep + cnt_wd > 5) confidence = 65.0;
+    printf("%s\n", language ? "---- Balance Predictor (ML) ----" : "---- Balance Predictor (ML) ----");
+    printf("Avg deposit: %.2f | Avg withdraw: %.2f\n", avg_dep, avg_wd);
+    printf("Expected net change: %.2f\n", expected_change);
+    printf("Predicted next balance: %.2f\n", predicted_next);
+    printf("Confidence: %.1f%%\n", confidence);
+}
+
+/* Additional menu (1..11) */
+static void additional_menu(void) {
+    for (;;) {
+        banner();
+        if (!language) {
+            printf("1. Account Summary / Statement\n");
+            printf("2. Change PIN\n");
+            printf("3. Schedule Future Transaction\n");
+            printf("4. Cancel Scheduled Transaction\n");
+            printf("5. Export Data to File\n");
+            printf("6. Delete Account\n");
+            printf("7. System Report\n");
+            printf("8. Reset / Clear All Data\n");
+            printf("9. Smart Balance Calculator (AI)\n");
+            printf("10. Balance Predictor (ML)\n");
+            printf("11. Back to Main Menu\n");
+            printf("\nEnter choice: ");
+        } else {
+            printf("1. கணக்கு சுருக்கம் / அறிக்கை\n");
+            printf("2. PIN மாற்று\n");
+            printf("3. எதிர்கால பரிவர்த்தனை திட்டமிடு\n");
+            printf("4. திட்டமிடப்பட்ட பரிவர்த்தனையை ரத்து செய்\n");
+            printf("5. கோப்பிற்கு ஏற்றுமதி\n");
+            printf("6. கணக்கு நீக்கு\n");
+            printf("7. கணினி அறிக்கை\n");
+            printf("8. அனைத்து தரவையும் நீக்கு\n");
+            printf("9. ஸ்மார்ட் இருப்பு கணக்கீடு (AI)\n");
+            printf("10. இருப்பு முன்னறிவு (ML)\n");
+            printf("11. மெயின் மெனுவுக்கு திரும்பு\n");
+            printf("\nவிருப்பத்தை உள்ளிடவும்: ");
+        }
+        char buf[16];
+        if (!fgets(buf,sizeof buf, stdin)) { clearerr(stdin); buf[0]=0; }
+        int c = atoi(buf);
+        if (c==1) account_summary();
+        else if (c==2) change_pin();
+        else if (c==3) schedule_future_transaction();
+        else if (c==4) cancel_scheduled_transaction();
+        else if (c==5) export_data_to_file();
+        else if (c==6) delete_account();
+        else if (c==7) system_report();
+        else if (c==8) reset_clear_all_data();
+        else if (c==9) smart_balance_calculator();
+        else if (c==10) balance_predictor_ml();
+        else if (c==11) return;
+        else printf("%s\n", language ? "தவறான தேர்வு." : "Invalid choice.");
+        printf("\nPress Enter to continue...");
+        flush_stdin();
+    }
+}
+
+/* Main menu */
+int main(void) {
+    srand((unsigned)time(NULL));
+    load_accounts_from_disk();
+    load_transactions_from_disk();
+    for (;;) {
+        banner();
+        if (!language) {
+            printf("1. Create Account\n");
+            printf("2. Deposit\n");
+            printf("3. Withdraw\n");
+            printf("4. Transfer\n");
+            printf("5. View Balance\n");
+            printf("6. View All Accounts\n");
+            printf("7. Transaction History\n");
+            printf("8. Scheduled Transactions\n");
+            printf("9. Additional Options\n");
+            printf("10. Exit\n");
+            printf("\nEnter choice: ");
+        } else {
+            printf("1. கணக்கை உருவாக்கு\n");
+            printf("2. வைப்பு\n");
+            printf("3. பணம் எடு\n");
+            printf("4. பணம் மாற்று\n");
+            printf("5. இருப்பு பார்க்க\n");
+            printf("6. அனைத்து கணக்குகள்\n");
+            printf("7. பரிவர்த்தனை வரலாறு\n");
+            printf("8. திட்டமிடப்பட்ட பரிவர்த்தனைகள்\n");
+            printf("9. கூடுதல் விருப்பங்கள்\n");
+            printf("10. வெளியேறு\n");
+            printf("\nவிருப்பத்தை உள்ளிடவும்: ");
+        }
+        char choicebuf[16];
+        if (!fgets(choicebuf,sizeof choicebuf, stdin)) { clearerr(stdin); choicebuf[0]=0; }
+        int ch = atoi(choicebuf);
+        if (ch==1) create_account();
+        else if (ch==2) deposit_or_withdraw(0);
+        else if (ch==3) deposit_or_withdraw(1);
+        else if (ch==4) transfer_flow();
+        else if (ch==5) view_balance();
+        else if (ch==6) view_all_accounts();
+        else if (ch==7) show_history();
+        else if (ch==8) view_scheduled();
+        else if (ch==9) additional_menu();
+        else if (ch==10) {
+            save_accounts_to_disk();
+            save_transactions_to_disk();
+            printf("%s\n", language ? "வெளியேறுகிறது..." : "Exiting...");
+            break;
+        } else {
+            printf("%s\n", language ? "தவறான தேர்வு." : "Invalid choice.");
+        }
+        printf("\nPress Enter to continue...");
+        flush_stdin();
+    }
+    return 0;
+}
